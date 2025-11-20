@@ -3,9 +3,10 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, EmailStr
+from fastapi.security.api_key import APIKeyHeader
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="FlamesAI Document Intelligence API")
 
@@ -16,6 +17,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------- API Key Security ----------
+API_KEY_HEADER = APIKeyHeader(name="x-api-key", auto_error=False)
+
+
+def get_allowed_keys() -> List[str]:
+    # Support comma-separated API_KEYS or single API_KEY
+    keys = os.getenv("API_KEYS") or os.getenv("API_KEY") or ""
+    parts = [k.strip() for k in keys.split(",") if k.strip()]
+    return parts
+
+
+def verify_api_key(api_key: Optional[str] = Depends(API_KEY_HEADER)) -> Optional[str]:
+    allowed = get_allowed_keys()
+    if not allowed:
+        # If no keys configured, run in open mode
+        return None
+    if not api_key or api_key not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key",
+        )
+    return api_key
 
 
 # ---------- Models ----------
@@ -30,6 +55,20 @@ class AnalyzeResponse(BaseModel):
     suggested_improvements: List[str]
     final_clean_version: str
     structured_json: Dict[str, Any]
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    metadata: Dict[str, Any] = {}
 
 
 # ---------- Utilities ----------
@@ -161,7 +200,8 @@ def analyze_text(text: str) -> AnalyzeResponse:
             label = key.replace("_", " ").title()
             lines.append(f"{label}: {filled[key]}")
     final_text = (
-        "Validated document. Fields are organized, normalized, and formatted.\n" + "\n".join(lines)
+        "Validated document. Fields are organized, normalized, and formatted.\n"
+        + "\n".join(lines)
         if lines
         else "No structured fields detected. Provide clearer key:value lines for best results."
     )
@@ -207,6 +247,7 @@ def test_database():
         "database_name": None,
         "connection_status": "Not Connected",
         "collections": [],
+        "api_keys_enforced": bool(get_allowed_keys()),
     }
 
     try:
@@ -237,10 +278,69 @@ def test_database():
     return response
 
 
+@app.get("/keys/test")
+def test_key(api_key: Optional[str] = Depends(verify_api_key)):
+    enforced = bool(get_allowed_keys())
+    return {
+        "api_keys_enforced": enforced,
+        "status": "ok" if (api_key or not enforced) else "forbidden",
+    }
+
+
 @app.post("/analyze", response_model=AnalyzeResponse)
-def analyze(req: AnalyzeRequest):
-    """Lightweight heuristic analyzer that extracts key:value pairs, validates common fields, and returns a clean, acceptance-oriented result."""
+def analyze(req: AnalyzeRequest, _: Optional[str] = Depends(verify_api_key)):
+    """Heuristic analyzer that extracts key:value pairs, validates common fields, and returns a clean, acceptance-oriented result.
+
+    When API keys are configured via API_KEY or API_KEYS, this endpoint requires header: x-api-key.
+    """
     return analyze_text(req.content)
+
+
+@app.post("/agent/chat", response_model=ChatResponse)
+def agent_chat(req: ChatRequest, _: Optional[str] = Depends(verify_api_key)):
+    """Simple autopilot chat agent for document assistance. It can analyze pasted text blocks automatically."""
+    if not req.messages:
+        return ChatResponse(
+            reply=(
+                "I'm your FlamesAI autopilot. Paste a document or say 'analyze:' followed by text, and I'll validate, fill, and summarize it."
+            )
+        )
+
+    last = req.messages[-1]
+    content = last.content.strip()
+
+    # If user writes analyze: or includes likely key:value blocks, run analyzer
+    trigger = content.lower().startswith("analyze:")
+    looks_structured = ":" in content and len(content.splitlines()) >= 2
+
+    if trigger:
+        content = content[len("analyze:") :].strip()
+
+    if trigger or looks_structured:
+        analysis = analyze_text(content)
+        reply_lines = [
+            "Here's the cleaned summary and validation:",
+            "",
+            analysis.final_clean_version,
+            "",
+            f"Missing: {', '.join(analysis.missing_fields) if analysis.missing_fields else 'None'}",
+        ]
+        return ChatResponse(
+            reply="\n".join(reply_lines),
+            metadata={
+                "filled_fields": analysis.filled_fields,
+                "corrected_fields": analysis.corrected_fields,
+                "missing_fields": analysis.missing_fields,
+                "structured_json": analysis.structured_json,
+            },
+        )
+
+    # Otherwise, respond helpfully
+    help_text = (
+        "I can extract fields, validate emails/phones/dates, and return a compliance-ready version. "
+        "Paste your document, or start with 'analyze:' then your text."
+    )
+    return ChatResponse(reply=help_text)
 
 
 if __name__ == "__main__":
